@@ -1,4 +1,5 @@
 /* PEA Electric Bill Card
+ * Version: 1.0.3 (untagged - pending test confirmation before release)
  * A Lovelace card that estimates a Provincial Electricity Authority (PEA, Thailand)
  * residential electric bill from cumulative energy sensors (e.g. exposed by a battery /
  * energy-monitoring integration), supporting both the "Normal" (tiered/bucket) tariff
