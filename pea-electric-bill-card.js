@@ -201,10 +201,22 @@ async function fetchStatPoints(hass, entityId, start, end) {
     return [];
   }
   const series = (result && result[entityId]) || [];
-  return series
+  const points = series
     .filter((p) => p.sum != null)
     .map((p) => ({ time: new Date(p.end), value: p.sum }))
     .sort((a, b) => a.time - b.time);
+
+  // The most recent hour's statistic can lag behind real time: if the
+  // recorder hasn't finished computing it yet, the API returns a stale
+  // duplicate of the prior hour's sum instead of omitting the row. Trim
+  // trailing points with no change from the one before them so that time
+  // gets covered by the raw-history tail in fetchUsageSegments instead,
+  // which is always current. Safe even for a genuinely flat sensor: the
+  // raw-history tail computes the same zero delta either way.
+  while (points.length > 1 && points[points.length - 1].value === points[points.length - 2].value) {
+    points.pop();
+  }
+  return points;
 }
 
 // Long-term statistics' "sum" and raw history's "state" are NOT on the same
