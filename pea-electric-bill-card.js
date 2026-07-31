@@ -204,6 +204,12 @@ async function fetchStatPoints(hass, entityId, start, end) {
   const points = series
     .filter((p) => p.sum != null)
     .map((p) => ({ time: new Date(p.end), value: p.sum }))
+    // The API filters rows by bucket START against end_time, so a bucket
+    // whose start is just before `end` but whose end (and thus the true
+    // "as of" time of its value) falls after `end` can still come back.
+    // Drop those explicitly - every point this function returns must be
+    // valid-as-of at or before `end`.
+    .filter((p) => p.time.getTime() <= end.getTime())
     .sort((a, b) => a.time - b.time);
 
   // The most recent hour's statistic can lag behind real time: if the
@@ -230,9 +236,24 @@ async function fetchStatPoints(hass, entityId, start, end) {
 // sensors (e.g. PV total and export total, see splitSelfConsumedByExport)
 // can be paired stats-with-stats and history-with-history rather than ever
 // being compared across the scale boundary.
+//
+// Long-term statistics for the last few hours can't be trusted: if the
+// recorder hasn't finished computing an hour yet, the API can return a
+// stale duplicate of the prior hour's value instead of omitting the row -
+// and once a newer (correctly-computed) row appears after it, that stale
+// row is no longer at the trailing edge, so a simple "drop trailing
+// duplicates" check stops catching it. Rather than trying to detect
+// staleness after the fact, never ask statistics for anything within this
+// margin of `now` - that window always comes from raw history instead,
+// which is authoritative for anything within HA's recorder retention
+// (typically ~10 days).
+const STATS_SAFETY_MARGIN_MS = 3 * 60 * 60 * 1000; // 3 hours
+
 async function fetchUsageSegments(hass, entityId, start, end) {
   if (!entityId) return [];
-  const statPoints = await fetchStatPoints(hass, entityId, start, end);
+  const safeStatsEnd = new Date(Math.max(start.getTime(), end.getTime() - STATS_SAFETY_MARGIN_MS));
+  const statPoints =
+    safeStatsEnd.getTime() > start.getTime() ? await fetchStatPoints(hass, entityId, start, safeStatsEnd) : [];
   const tailStart = statPoints.length ? statPoints[statPoints.length - 1].time : start;
   const tailPoints = await fetchSeries(hass, entityId, tailStart, end);
   const segments = [];
