@@ -169,13 +169,29 @@ async function fetchSeries(hass, entityId, start, end) {
 // indefinitely at hourly resolution, unlike raw history which is typically
 // purged after ~10 days. The "sum" stat already compensates for meter
 // resets, so it's the more robust source whenever it's available.
+//
+// Each hourly row's "sum" is only valid AS OF THE END of that hour, not the
+// start - e.g. the row covering 09:00-10:00 reports the cumulative value at
+// 10:00. Two things follow from that:
+//  1. We request one extra hour before `start` so the first returned row's
+//     end lands exactly on `start`, giving a real baseline reading at the
+//     true period start instead of silently starting the count an hour late
+//     (getPeriodStart() always returns a local midnight, i.e. an hour
+//     boundary, so this always lines up).
+//  2. Each point is timestamped with `p.end`, not `p.start`. splitUsageByPeak
+//     classifies a delta by the timestamp of the point BEFORE it, i.e. the
+//     true start of the hour that delta represents - labelling with `p.start`
+//     instead puts every classification a full hour too early (e.g. usage
+//     genuinely drawn during 09:00-10:00, on-peak, would be classified using
+//     08:00 and counted as off-peak).
 async function fetchStatPoints(hass, entityId, start, end) {
   if (!entityId) return [];
+  const queryStart = new Date(start.getTime() - 60 * 60 * 1000);
   let result;
   try {
     result = await hass.callWS({
       type: "recorder/statistics_during_period",
-      start_time: start.toISOString(),
+      start_time: queryStart.toISOString(),
       end_time: end.toISOString(),
       statistic_ids: [entityId],
       period: "hour",
@@ -187,7 +203,7 @@ async function fetchStatPoints(hass, entityId, start, end) {
   const series = (result && result[entityId]) || [];
   return series
     .filter((p) => p.sum != null)
-    .map((p) => ({ time: new Date(p.start), end: new Date(p.end), value: p.sum }))
+    .map((p) => ({ time: new Date(p.end), value: p.sum }))
     .sort((a, b) => a.time - b.time);
 }
 
@@ -205,7 +221,7 @@ async function fetchStatPoints(hass, entityId, start, end) {
 async function fetchUsageSegments(hass, entityId, start, end) {
   if (!entityId) return [];
   const statPoints = await fetchStatPoints(hass, entityId, start, end);
-  const tailStart = statPoints.length ? statPoints[statPoints.length - 1].end : start;
+  const tailStart = statPoints.length ? statPoints[statPoints.length - 1].time : start;
   const tailPoints = await fetchSeries(hass, entityId, tailStart, end);
   const segments = [];
   if (statPoints.length) segments.push({ source: "stats", points: statPoints });
