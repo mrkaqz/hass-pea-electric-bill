@@ -1,5 +1,5 @@
 /* PEA Electric Bill Card
- * Version: 1.0.3
+ * Version: 1.1.0
  * A Lovelace card that estimates a Provincial Electricity Authority (PEA, Thailand)
  * residential electric bill from cumulative energy sensors (e.g. exposed by a battery /
  * energy-monitoring integration), supporting both the "Normal" (tiered/bucket) tariff
@@ -8,31 +8,95 @@
  * Thai holiday-aware TOU billing, and PEA solar buy-back (export) revenue.
  */
 
-const DEFAULT_RATES = {
-  normal: {
-    "1.1.1": {
-      label: "Type 1.1.1 (≤150 units/month)",
-      serviceCharge: 8.19,
-      tiers: [
-        { upTo: 15, rate: 2.3488 },
-        { upTo: 25, rate: 2.9882 },
-        { upTo: 35, rate: 3.2405 },
-        { upTo: 100, rate: 3.6237 },
-        { upTo: 150, rate: 3.7171 },
-        { upTo: 400, rate: 4.2218 },
-        { upTo: Infinity, rate: 4.4217 },
-      ],
-    },
-    "1.1.2": {
-      label: "Type 1.1.2 (>150 units/month)",
-      serviceCharge: 24.62,
-      tiers: [
-        { upTo: 150, rate: 3.2484 },
-        { upTo: 400, rate: 4.2218 },
-        { upTo: Infinity, rate: 4.4217 },
-      ],
-    },
+// PEA residential tiered ("Normal") energy rates.
+//
+// These changed from the September 2569 (2026) bill onward, per the ERC
+// resolution of 5 Aug 2569 (PEA announcement 14 Aug 2569): public
+// street-lighting cost (0.0634 B/unit) was removed from the residential base
+// tariff, and the first 200 units were capped at 3 B/unit. Monthly service
+// charges were NOT changed, and the TOU tariff was NOT affected at all - the
+// restructure covers only the progressive/tiered residential types (PEA
+// 1.1.1 and 1.1.2, i.e. MEA's 1.1 and 1.2).
+//
+// Both tables are kept so that periods predating the change still bill at
+// the rates that actually applied then - see normalRatesFor().
+const NORMAL_RATES_BEFORE_SEP_2026 = {
+  "1.1.1": {
+    label: "Type 1.1.1 (≤150 units/month)",
+    serviceCharge: 8.19,
+    tiers: [
+      { upTo: 15, rate: 2.3488 },
+      { upTo: 25, rate: 2.9882 },
+      { upTo: 35, rate: 3.2405 },
+      { upTo: 100, rate: 3.6237 },
+      { upTo: 150, rate: 3.7171 },
+      // The official table lists 151-200 and 201-400 separately, but both
+      // were 4.2218, so they collapse into one tier here.
+      { upTo: 400, rate: 4.2218 },
+      { upTo: Infinity, rate: 4.4217 },
+    ],
   },
+  "1.1.2": {
+    label: "Type 1.1.2 (>150 units/month)",
+    serviceCharge: 24.62,
+    tiers: [
+      { upTo: 150, rate: 3.2484 },
+      { upTo: 400, rate: 4.2218 },
+      { upTo: Infinity, rate: 4.4217 },
+    ],
+  },
+};
+
+const NORMAL_RATES_FROM_SEP_2026 = {
+  "1.1.1": {
+    label: "Type 1.1.1 (≤150 units/month)",
+    serviceCharge: 8.19,
+    tiers: [
+      // The two lowest tiers were already below the new 3 B/unit cap, so
+      // they carry over unchanged; everything from 26-200 collapses to 3.
+      { upTo: 15, rate: 2.3488 },
+      { upTo: 25, rate: 2.9882 },
+      { upTo: 200, rate: 3.0 },
+      { upTo: 400, rate: 4.1584 },
+      { upTo: Infinity, rate: 4.3583 },
+    ],
+  },
+  "1.1.2": {
+    label: "Type 1.1.2 (>150 units/month)",
+    serviceCharge: 24.62,
+    tiers: [
+      { upTo: 200, rate: 3.0 },
+      { upTo: 400, rate: 4.1584 },
+      { upTo: Infinity, rate: 4.3583 },
+    ],
+  },
+};
+
+// First bill month that uses the new rates: September 2569 (2026).
+const NEW_NORMAL_RATES_FROM = new Date(2026, 8, 1, 0, 0, 0, 0);
+
+// Picks the tiered rate table for a billing period by when it ENDS, since
+// that's what determines which monthly bill the usage lands on: a cycle
+// running 22 Aug - 21 Sep is billed as the September bill and so uses the
+// new rates, even though it started in August. A cycle that straddles the
+// changeover is billed at a single rate table either way - PEA does not
+// split it - so this matches how the bill is actually issued.
+function normalRatesFor(periodEnd) {
+  // Duck-typed rather than `instanceof Date`, which silently fails for a Date
+  // originating from another realm (iframe, test sandbox) and would then
+  // quietly fall back to "now" instead of the period actually asked about.
+  const raw = periodEnd && typeof periodEnd.getTime === "function" ? periodEnd.getTime() : NaN;
+  const when = Number.isNaN(raw) ? Date.now() : raw;
+  return when >= NEW_NORMAL_RATES_FROM.getTime()
+    ? NORMAL_RATES_FROM_SEP_2026
+    : NORMAL_RATES_BEFORE_SEP_2026;
+}
+
+const DEFAULT_RATES = {
+  // The visual editor edits whichever tiered table is current as of now;
+  // _calcBill() picks independently by period end, so a past period still
+  // bills at the rates that applied to it.
+  normal: normalRatesFor(new Date()),
   // PEA's TOU tariff (No. 1.2) is split by voltage level, unlike MEA's flat TOU rate.
   // Virtually every residential customer is on 1.2.2 (below 22 kV).
   tou: {
@@ -649,6 +713,9 @@ class PeaElectricBillCard extends HTMLElement {
     }
 
     this._cycleStart = start;
+    // Used by normalRatesFor() to bill a period at the rates in force for
+    // the month it lands on.
+    this._periodEnd = now;
     this._render();
   }
 
@@ -682,7 +749,7 @@ class PeaElectricBillCard extends HTMLElement {
     if (cfg.scheme === "normal") {
       const rateSet =
         (cfg.rates.normal && cfg.rates.normal[cfg.tariff_class]) ||
-        DEFAULT_RATES.normal[cfg.tariff_class];
+        normalRatesFor(this._periodEnd)[cfg.tariff_class];
       units = this._usage && this._usage.units != null ? this._usage.units : 0;
       energyCharge = tieredEnergyCharge(units, rateSet.tiers);
       serviceCharge = rateSet.serviceCharge;

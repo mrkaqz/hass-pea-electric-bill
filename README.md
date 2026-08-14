@@ -203,6 +203,43 @@ ERC. Only the class names differ (PEA: `1.1.1`/`1.1.2`; MEA: `1.1`/`1.2`). Old
 configs carrying the MEA-style `tariff_class` values are migrated
 automatically.
 
+### Tiered rate change from the September 2569 (2026) bill
+
+Per the ERC resolution of 5 Aug 2569 (PEA announcement 14 Aug 2569), the
+progressive residential tariff was restructured from the **September 2569
+bill onward**: public street-lighting cost (0.0634 ฿/unit) was removed from
+the residential base tariff, and the first 200 units capped at 3 ฿/unit. The
+average billed rate drops from 3.95 to 3.86 ฿/unit (excl. VAT).
+
+Type **1.1.1** (≤150 units/month):
+
+| Units | Old | New |
+|---|---|---|
+| 0–15 | 2.3488 | 2.3488 |
+| 16–25 | 2.9882 | 2.9882 |
+| 26–200 | 3.2405 / 3.6237 / 3.7171 / 4.2218 | **3.0000** |
+| 201–400 | 4.2218 | **4.1584** |
+| 401+ | 4.4217 | **4.3583** |
+
+Type **1.1.2** (>150 units/month):
+
+| Units | Old | New |
+|---|---|---|
+| 0–200 | 3.2484 / 4.2218 | **3.0000** |
+| 201–400 | 4.2218 | **4.1584** |
+| 401+ | 4.4217 | **4.3583** |
+
+Monthly service charges are unchanged (8.19 ฿ / 24.62 ฿), and **the TOU
+tariff is not affected at all** — the restructure covers only the
+progressive/tiered residential types.
+
+The card keeps both tables and picks between them by **when the billing
+period ends**, since that determines which monthly bill the usage lands on:
+a cycle running 22 Aug – 21 Sep is billed as the September bill and so uses
+the new rates, even though it started in August. PEA bills a straddling
+cycle at one rate table rather than splitting it, so this matches how the
+bill is actually issued.
+
 **PEA's TOU tariff genuinely differs** and is split by voltage level:
 
 | Tariff | Service charge | On-peak (฿/unit) | Off-peak (฿/unit) |
@@ -225,15 +262,20 @@ rates:
     "1.1.2":
       serviceCharge: 24.62
       tiers:
-        - { upTo: 150, rate: 3.2484 }
-        - { upTo: 400, rate: 4.2218 }
-        - { upTo: .inf, rate: 4.4217 }
+        - { upTo: 200, rate: 3.0000 }
+        - { upTo: 400, rate: 4.1584 }
+        - { upTo: .inf, rate: 4.3583 }
   tou:
     "1.2.2":
       serviceCharge: 24.62
       onPeakRate: 5.7982
       offPeakRate: 2.6369
 ```
+
+Note that an explicit `rates.normal` override replaces the built-in table
+outright and therefore opts out of the automatic pre-/post-September-2569
+rate switching described above — the rates you supply are used for every
+period.
 
 ## Auto-updating Ft
 
