@@ -53,6 +53,11 @@ buy-back (export) revenue.
   solar rooftop buy-back programme, show how much your exported units earned
   you, as a separate line from your bill and from your self-consumption
   savings.
+- **Previous billing cycle comparison** — on the Bill cycle tab, see last
+  cycle's complete cost alongside a like-for-like "pace" comparison of the
+  current, still-in-progress cycle against the previous one at the same
+  elapsed offset. See [Previous cycle comparison](#previous-cycle-comparison)
+  below.
 
 ## Installation
 
@@ -183,6 +188,7 @@ more detail on the non-trivial ones (Ft, holidays, solar).
 | `holiday_onpeak_keywords` | map | `{ ploughing: [...], compensatory: [...] }` | Optional override of the keyword lists used to classify `holiday_calendar` events. TOU only. |
 | `export_rate` | number | `2.20` | PEA solar buy-back rate, baht/unit |
 | `show_export` | boolean | `false` | Show the export-revenue line; only turn on if you're registered in PEA's buy-back programme |
+| `show_previous_cycle` | boolean | `true` | Show the previous billing cycle comparison on the **Bill cycle** tab; see [Previous cycle comparison](#previous-cycle-comparison) |
 | `entities` | map | — | See table below |
 | `rates` | map | — | Optional override of the built-in tariff figures; see [Overriding rates](#overriding-rates) |
 
@@ -400,6 +406,63 @@ show phantom income to unregistered users, which is worse than requiring an
 opt-in. The 2.20 ฿/unit rate and the 5 kW export cap are programme terms set
 per annual round; treat `export_rate` as a figure to verify against your own
 contract, not a fixed constant.
+
+## Previous cycle comparison
+
+On the **Bill cycle** tab, the card can show last cycle's cost alongside the
+current one, so you're not left guessing how the cycle that just ended
+compares - the tab resets to the new cycle the instant the cutoff day passes,
+which otherwise makes the just-finished cycle disappear entirely. Controlled
+by `show_previous_cycle` (default **on**); it only affects the Bill cycle tab
+- Day/Week/Month are unaffected and issue no extra fetches.
+
+Two lines appear below "Net cost" (or "Estimated total" if export isn't
+shown):
+
+```
+Previous cycle (22 Jun – 21 Jul)   1,102.30 ฿
+Day 9 pace vs last cycle              ▼ 21.6%
+```
+
+- **Previous cycle** is last cycle's *complete* net cost (or total, if you
+  don't show export) - the number you actually want right after a reset.
+- **Pace** compares the current cycle to the previous cycle **at the same
+  elapsed offset** (e.g. "Day 9" means both cycles are compared through their
+  first 9 days), not to the complete previous total above it - a partial
+  current-cycle number next to a complete previous one would otherwise make
+  the percentage meaningless (three days into a 30-day cycle you'd see
+  "▼ 91%" for doing nothing differently). ▼ means you're running lower than
+  last cycle at this point, ▲ means higher.
+
+The pace line is hidden whenever there's nothing meaningful to compare
+against - no previous cycle, or a same-offset previous figure of exactly
+zero (which would otherwise divide by zero or show a meaningless `∞%`).
+
+A few things worth knowing:
+
+- **Ft is taken as current for both cycles.** The Ft (fuel adjustment) sensor
+  only exposes its *present* value - there's no historical Ft to look up.
+  Ft typically changes only every four months, so the previous cycle
+  usually matches what was actually billed, but across an Ft transition the
+  previous-cycle figure here is recomputed at the *new* Ft and will differ
+  slightly from the bill PEA actually issued. A historical lookup isn't
+  practical: raw history for a month-old billing period is already purged by
+  the time you'd need it, so it would fall back to the current value anyway.
+- **Pace granularity is hourly.** The previous cycle's figures come from
+  long-term statistics (hourly resolution), so slicing at an arbitrary
+  elapsed offset lands on the nearest hour boundary rather than the exact
+  minute.
+- **The `cutoff_day` 29–31 rollover is pre-existing and unrelated to this
+  feature** - a cutoff day that doesn't exist in a given month (e.g. day 31
+  in February) already rolls forward to the nearest valid date. This feature
+  guards against the resulting edge case by hiding the comparison rather than
+  showing a zero-length or inverted range; it doesn't change how the
+  current-cycle date itself is computed. A proper fix (clamping the cutoff
+  day to the month length) would change current-cycle behaviour too and is
+  out of scope here.
+- **This roughly doubles the history/statistics fetches on the Bill cycle
+  tab** (current and previous cycle are fetched in parallel), still behind
+  the existing 60-second throttle. Day/Week/Month are untouched.
 
 ## Notes
 

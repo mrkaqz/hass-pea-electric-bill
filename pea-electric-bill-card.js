@@ -1,5 +1,5 @@
 /* PEA Electric Bill Card
- * Version: 1.1.0
+ * Version: 1.2.0
  * A Lovelace card that estimates a Provincial Electricity Authority (PEA, Thailand)
  * residential electric bill from cumulative energy sensors (e.g. exposed by a battery /
  * energy-monitoring integration), supporting both the "Normal" (tiered/bucket) tariff
@@ -153,6 +153,24 @@ function getCycleStart(cutoffDay, now) {
   return start;
 }
 
+// Derives the previous billing cycle's [start, end) range for comparison
+// against the current one. Reuses getCycleStart() on the instant just before
+// the current cycle start, so both boundaries come from exactly one rule
+// rather than a second, possibly-diverging month-arithmetic implementation.
+//
+// getCycleStart() builds dates as `new Date(y, m, cutoffDay)`, which rolls
+// over for a cutoff_day of 29-31 in a short month (e.g. Feb 31 -> Mar 3) and
+// only ever steps back one calendar month - so for that degenerate case it
+// can return a "previous" start that isn't actually before the instant asked
+// about. Return null rather than a zero-length or inverted range; the caller
+// should hide the comparison entirely.
+function getPreviousCycleRange(cutoffDay, now) {
+  const currentStart = getCycleStart(cutoffDay, now);
+  const prevStart = getCycleStart(cutoffDay, new Date(currentStart.getTime() - 1));
+  if (!(prevStart < currentStart)) return null;
+  return { start: prevStart, end: currentStart };
+}
+
 const PERIODS = {
   day: { label: "Day" },
   week: { label: "Week" },
@@ -180,6 +198,16 @@ function dateKeyOf(date) {
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Fixed "22 Jun" style formatting for the previous-cycle date range, rather
+// than toLocaleDateString() (used for the "Since ..." label elsewhere) -
+// that label is a single localized date, but a "start - end" range reads
+// better with a consistent, compact, locale-independent format on both ends.
+function formatShortDate(date) {
+  return `${date.getDate()} ${MONTH_ABBR[date.getMonth()]}`;
 }
 
 // PEA residential TOU schedule (Mon-Fri 09:00-22:00 = on-peak) plus PEA's actual
@@ -332,6 +360,22 @@ async function fetchUsageSegments(hass, entityId, start, end) {
   if (statPoints.length) segments.push({ source: "stats", points: statPoints });
   if (tailPoints.length) segments.push({ source: "history", points: tailPoints });
   return segments;
+}
+
+// Slices already-fetched labelled segments (see fetchUsageSegments) down to
+// a cutoff timestamp, without re-fetching anything. Used to derive the
+// previous cycle's "pace" figure - its subtotal at the same elapsed offset
+// as the current, still-in-progress cycle - from data already fetched for
+// the full previous cycle. Filters each segment's own points only; never
+// merges, reorders, or otherwise touches the stats/history source labelling
+// that keeps the two numeric scales apart (see the big comment above
+// fetchUsageSegments).
+function sliceSegments(segments, cutoff) {
+  if (!cutoff) return segments;
+  return segments.map((seg) => ({
+    source: seg.source,
+    points: seg.points.filter((p) => p.time <= cutoff),
+  }));
 }
 
 function totalUsageMulti(segments) {
@@ -586,6 +630,7 @@ class PeaElectricBillCard extends HTMLElement {
       entities: {},
       export_rate: EXPORT_RATE_DEFAULT,
       show_export: false,
+      show_previous_cycle: true,
     };
   }
 
@@ -642,6 +687,7 @@ class PeaElectricBillCard extends HTMLElement {
       holiday_onpeak_keywords: config.holiday_onpeak_keywords || DEFAULT_HOLIDAY_KEYWORDS,
       export_rate: Number(config.export_rate ?? EXPORT_RATE_DEFAULT),
       show_export: Boolean(config.show_export),
+      show_previous_cycle: Boolean(config.show_previous_cycle ?? true),
     };
     if (!this._period) this._period = defaultPeriod;
     this._lastFetch = 0;
@@ -671,58 +717,129 @@ class PeaElectricBillCard extends HTMLElement {
     this._updateUsage();
   }
 
-  async _updateUsage() {
-    if (!this._hass || !this._config) return;
+  // Pure I/O: fetches everything needed to derive a bill for [start, end),
+  // with no derivation performed here. Split out from _updateUsage() so the
+  // same fetch can be issued for both the current and (on the Bill cycle
+  // tab) the previous billing cycle. Holidays are fetched per range (TOU
+  // only) since the applicable dates differ between the two periods.
+  async _fetchPeriodRaw(start, end) {
     const cfg = this._config;
-    const now = new Date();
-    const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
-
-    // Holidays only affect TOU billing; skip the calendar/dates fetch entirely
-    // for Normal-scheme users.
-    const holidays = cfg.scheme === "tou" ? await fetchHolidays(this._hass, cfg, start, now) : null;
+    const holidays = cfg.scheme === "tou" ? await fetchHolidays(this._hass, cfg, start, end) : null;
 
     const totalEntities = toArray(cfg.entities.total);
     const segmentsPerEntity = await Promise.all(
-      totalEntities.map((id) => fetchUsageSegments(this._hass, id, start, now))
+      totalEntities.map((id) => fetchUsageSegments(this._hass, id, start, end))
     );
+
+    // Export total is fetched once and used for both the self-consumption
+    // calc (preferred method, see splitSelfConsumedByExport) and the export
+    // revenue line - it's needed independently of pv_total.
+    const exportSegments = cfg.entities.pv_export_total
+      ? await fetchUsageSegments(this._hass, cfg.entities.pv_export_total, start, end)
+      : null;
+
+    let pvSegments = null;
+    let ratePoints = null;
+    if (cfg.entities.pv_total) {
+      pvSegments = await fetchUsageSegments(this._hass, cfg.entities.pv_total, start, end);
+      if (!exportSegments) {
+        ratePoints = await fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, end);
+      }
+    }
+
+    return { segmentsPerEntity, exportSegments, pvSegments, ratePoints, holidays };
+  }
+
+  // Pure derivation: turns raw fetched data into { usage, selfConsumed,
+  // exportUnits }, with no I/O. When `cutoff` is given, every segment is
+  // sliced to it first (see sliceSegments) - this is what produces the
+  // "pace" figure (previous cycle up to the same elapsed offset as the
+  // current, in-progress cycle) with NO extra API calls, by re-deriving from
+  // data already fetched for the full previous cycle.
+  _derivePeriod(raw, cutoff) {
+    const cfg = this._config;
+    const segmentsPerEntity = raw.segmentsPerEntity.map((segs) => sliceSegments(segs, cutoff));
+
+    let usage;
     if (cfg.scheme === "normal") {
-      this._usage = {
-        units: segmentsPerEntity.reduce((sum, segs) => sum + totalUsageMulti(segs), 0),
-      };
+      usage = { units: segmentsPerEntity.reduce((sum, segs) => sum + totalUsageMulti(segs), 0) };
     } else {
-      this._usage = segmentsPerEntity.reduce(
+      usage = segmentsPerEntity.reduce(
         (acc, segs) => {
-          const split = splitUsageByPeakMulti(segs, holidays);
+          const split = splitUsageByPeakMulti(segs, raw.holidays);
           return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
         },
         { onPeak: 0, offPeak: 0 }
       );
     }
 
-    // Export total is fetched once and used for both the self-consumption
-    // calc (preferred method, see splitSelfConsumedByExport) and the export
-    // revenue line (Phase 6) - it's needed independently of pv_total.
-    const exportSegments = cfg.entities.pv_export_total
-      ? await fetchUsageSegments(this._hass, cfg.entities.pv_export_total, start, now)
-      : null;
-    this._exportUnits = exportSegments ? totalUsageMulti(exportSegments) : null;
+    const exportSegments = raw.exportSegments ? sliceSegments(raw.exportSegments, cutoff) : null;
+    const exportUnits = exportSegments ? totalUsageMulti(exportSegments) : null;
 
-    if (cfg.entities.pv_total) {
-      const pvSegments = await fetchUsageSegments(this._hass, cfg.entities.pv_total, start, now);
+    let selfConsumed = null;
+    if (raw.pvSegments) {
+      const pvSegments = sliceSegments(raw.pvSegments, cutoff);
       if (exportSegments) {
-        this._selfConsumed = splitSelfConsumedByExportMulti(pvSegments, exportSegments, holidays);
+        selfConsumed = splitSelfConsumedByExportMulti(pvSegments, exportSegments, raw.holidays);
       } else {
-        const ratePoints = await fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now);
-        this._selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, ratePoints, holidays);
+        // ratePoints is a plain point series, not a labelled segment list -
+        // no slicing needed. valueAt() only ever looks up a rate at or
+        // before a pv point's own timestamp, and pvSegments above is already
+        // sliced to cutoff, so lookups never reach past it anyway.
+        selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, raw.ratePoints, raw.holidays);
       }
-    } else {
-      this._selfConsumed = null;
     }
 
-    this._cycleStart = start;
+    return { usage, selfConsumed, exportUnits };
+  }
+
+  async _updateUsage() {
+    if (!this._hass || !this._config) return;
+    const cfg = this._config;
+    const now = new Date();
+    const period = this._period || "cycle";
+    const start = getPeriodStart(period, cfg.cutoff_day, now);
+
+    // Previous-cycle comparison only applies to the Bill cycle tab; Day /
+    // Week / Month keep their existing single-fetch load.
+    const showPrev = period === "cycle" && cfg.show_previous_cycle;
+    const prevRange = showPrev ? getPreviousCycleRange(cfg.cutoff_day, now) : null;
+
+    const [curRaw, prevRaw] = await Promise.all([
+      this._fetchPeriodRaw(start, now),
+      prevRange ? this._fetchPeriodRaw(prevRange.start, prevRange.end) : Promise.resolve(null),
+    ]);
+
+    this._current = this._derivePeriod(curRaw);
     // Used by normalRatesFor() to bill a period at the rates in force for
     // the month it lands on.
-    this._periodEnd = now;
+    this._current.periodEnd = now;
+    this._cycleStart = start;
+
+    if (prevRaw && prevRange) {
+      this._previous = this._derivePeriod(prevRaw);
+      this._previous.periodEnd = prevRange.end;
+      this._previousRange = prevRange;
+
+      // Pace: current cycle vs. the previous cycle AT THE SAME ELAPSED
+      // OFFSET, so the percentage is like-for-like even though the current
+      // cycle is almost always only partly elapsed. Slicing already-fetched
+      // previous-cycle data at this offset issues no extra API calls. The
+      // partial figure still belongs to the previous cycle's bill, so it
+      // uses the same rate era (periodEnd) as the full previous total, not
+      // the offset itself.
+      const elapsedMs = now.getTime() - start.getTime();
+      this._paceDay = Math.floor(elapsedMs / (24 * 60 * 60 * 1000)) + 1;
+      const paceCutoff = new Date(prevRange.start.getTime() + elapsedMs);
+      this._previousAtPace = this._derivePeriod(prevRaw, paceCutoff);
+      this._previousAtPace.periodEnd = prevRange.end;
+    } else {
+      this._previous = null;
+      this._previousAtPace = null;
+      this._previousRange = null;
+      this._paceDay = null;
+    }
+
     this._render();
   }
 
@@ -742,10 +859,21 @@ class PeaElectricBillCard extends HTMLElement {
     return cfg.ft_baht;
   }
 
-  _calcBill() {
+  // Takes its data as an argument (rather than reading instance fields
+  // directly) so the same calculation can be run for the current period, the
+  // full previous cycle, and the previous cycle sliced to the pace cutoff.
+  // `data` is { usage, selfConsumed, exportUnits, periodEnd } as produced by
+  // _derivePeriod() (plus periodEnd attached by the caller); it's undefined
+  // on first paint, before any fetch has resolved, hence the null-guards
+  // throughout - same behaviour as before the split.
+  _calcBill(data) {
     const cfg = this._config;
     const vat = cfg.vat;
     const ft = this._resolveFt(); // baht per unit
+    const usage = data && data.usage;
+    const selfConsumed = data && data.selfConsumed;
+    const exportUnits = data && data.exportUnits;
+    const periodEnd = data && data.periodEnd;
     let units;
     let energyCharge;
     let serviceCharge;
@@ -755,15 +883,14 @@ class PeaElectricBillCard extends HTMLElement {
 
     if (cfg.scheme === "normal") {
       const rateSet =
-        (cfg.rates.normal && cfg.rates.normal[cfg.tariff_class]) ||
-        normalRatesFor(this._periodEnd)[cfg.tariff_class];
-      units = this._usage && this._usage.units != null ? this._usage.units : 0;
+        (cfg.rates.normal && cfg.rates.normal[cfg.tariff_class]) || normalRatesFor(periodEnd)[cfg.tariff_class];
+      units = usage && usage.units != null ? usage.units : 0;
       energyCharge = tieredEnergyCharge(units, rateSet.tiers);
       serviceCharge = rateSet.serviceCharge;
       lines.push([`Energy (${units.toFixed(2)} units, tiered)`, energyCharge]);
 
-      if (this._selfConsumed) {
-        selfConsumedUnits = this._selfConsumed.onPeak + this._selfConsumed.offPeak;
+      if (selfConsumed) {
+        selfConsumedUnits = selfConsumed.onPeak + selfConsumed.offPeak;
         // Value the avoided units at their marginal (top-of-stack) rate: the
         // extra cost it would have taken to buy them from the grid on top of
         // what was actually billed.
@@ -772,8 +899,8 @@ class PeaElectricBillCard extends HTMLElement {
     } else {
       const rateSet =
         (cfg.rates.tou && cfg.rates.tou[cfg.tou_voltage_level]) || DEFAULT_RATES.tou[cfg.tou_voltage_level];
-      const onPeak = (this._usage && this._usage.onPeak) || 0;
-      const offPeak = (this._usage && this._usage.offPeak) || 0;
+      const onPeak = (usage && usage.onPeak) || 0;
+      const offPeak = (usage && usage.offPeak) || 0;
       units = onPeak + offPeak;
       const onPeakCharge = onPeak * rateSet.onPeakRate;
       const offPeakCharge = offPeak * rateSet.offPeakRate;
@@ -782,10 +909,9 @@ class PeaElectricBillCard extends HTMLElement {
       lines.push([`On-peak (${onPeak.toFixed(2)} units)`, onPeakCharge]);
       lines.push([`Off-peak (${offPeak.toFixed(2)} units)`, offPeakCharge]);
 
-      if (this._selfConsumed) {
-        selfConsumedUnits = this._selfConsumed.onPeak + this._selfConsumed.offPeak;
-        savingsEnergy =
-          this._selfConsumed.onPeak * rateSet.onPeakRate + this._selfConsumed.offPeak * rateSet.offPeakRate;
+      if (selfConsumed) {
+        selfConsumedUnits = selfConsumed.onPeak + selfConsumed.offPeak;
+        savingsEnergy = selfConsumed.onPeak * rateSet.onPeakRate + selfConsumed.offPeak * rateSet.offPeakRate;
       }
     }
 
@@ -798,7 +924,7 @@ class PeaElectricBillCard extends HTMLElement {
     const total = subtotal + vatAmount;
 
     let savings = null;
-    if (this._selfConsumed) {
+    if (selfConsumed) {
       const savingsFt = selfConsumedUnits * ft;
       const savingsSubtotal = savingsEnergy + savingsFt;
       const savingsVat = savingsSubtotal * (vat / 100);
@@ -814,10 +940,10 @@ class PeaElectricBillCard extends HTMLElement {
     // what PEA bills you). Only shown when the user has explicitly opted in
     // via show_export, since the buy-back only pays registered participants.
     let exportRevenue = null;
-    if (cfg.show_export && this._exportUnits != null) {
+    if (cfg.show_export && exportUnits != null) {
       exportRevenue = {
-        units: this._exportUnits,
-        total: this._exportUnits * cfg.export_rate,
+        units: exportUnits,
+        total: exportUnits * cfg.export_rate,
       };
     }
     const netCost = exportRevenue != null ? total - exportRevenue.total : null;
@@ -829,7 +955,7 @@ class PeaElectricBillCard extends HTMLElement {
     if (!this._config) return;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
 
-    const bill = this._calcBill();
+    const bill = this._calcBill(this._current);
     const period = this._period || "cycle";
     const cycleLabel = this._cycleStart
       ? `Since ${this._cycleStart.toLocaleDateString()}`
@@ -870,6 +996,56 @@ class PeaElectricBillCard extends HTMLElement {
             <span class="num">${bill.netCost.toFixed(2)} ฿</span>
           </div>`
         : "";
+
+    // Previous billing cycle comparison - Bill cycle tab only, opt-out via
+    // show_previous_cycle, and only when there's actually a previous cycle
+    // to compare against (see getPreviousCycleRange()'s null guard and the
+    // "no fetch" branch in _updateUsage()).
+    let previousCycleBlock = "";
+    if (period === "cycle" && this._config.show_previous_cycle && this._previous && this._previousRange) {
+      const prevBill = this._calcBill(this._previous);
+      // Mirror whichever bottom line the current view shows (net-of-export
+      // when export is on, else the plain total) so the two figures are
+      // directly comparable.
+      const prevHeadline = prevBill.netCost != null ? prevBill.netCost : prevBill.total;
+
+      if (prevHeadline != null && Number.isFinite(prevHeadline)) {
+        const rangeLabel = `${formatShortDate(this._previousRange.start)} – ${formatShortDate(
+          new Date(this._previousRange.end.getTime() - 1)
+        )}`;
+
+        // Pace line is deliberately labelled as a comparison against last
+        // cycle's SAME-OFFSET subtotal, not against the headline above -
+        // sitting bare beside the date range would read as a delta off the
+        // complete-cycle figure, which it is not. Suppressed entirely when
+        // the same-offset previous figure is 0 or unavailable, to avoid a
+        // divide-by-zero or a meaningless "∞%".
+        let paceLine = "";
+        if (this._previousAtPace) {
+          const paceBill = this._calcBill(this._previousAtPace);
+          const prevAtOffset = paceBill.netCost != null ? paceBill.netCost : paceBill.total;
+          const currentHeadline = bill.netCost != null ? bill.netCost : bill.total;
+          if (prevAtOffset && Number.isFinite(prevAtOffset) && Number.isFinite(currentHeadline)) {
+            const pct = ((currentHeadline - prevAtOffset) / prevAtOffset) * 100;
+            if (Number.isFinite(pct)) {
+              const lower = pct <= 0;
+              paceLine = `<div class="pace ${lower ? "pace-down" : "pace-up"}">
+                  <span>Day ${this._paceDay} pace vs last cycle</span>
+                  <span class="num">${lower ? "▼" : "▲"} ${Math.abs(pct).toFixed(1)}%</span>
+                </div>`;
+            }
+          }
+        }
+
+        previousCycleBlock = `<div class="previous-cycle">
+            <div class="headline">
+              <span>Previous cycle (${rangeLabel})</span>
+              <span class="num">${prevHeadline.toFixed(2)} ฿</span>
+            </div>
+            ${paceLine}
+          </div>`;
+      }
+    }
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -914,6 +1090,21 @@ class PeaElectricBillCard extends HTMLElement {
           font-size: 0.95em;
           font-weight: bold;
         }
+        .previous-cycle {
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed var(--divider-color);
+          font-size: 0.9em;
+          color: var(--secondary-text-color);
+        }
+        .previous-cycle .headline,
+        .previous-cycle .pace {
+          display: flex;
+          justify-content: space-between;
+        }
+        .previous-cycle .pace { margin-top: 4px; }
+        .previous-cycle .pace-down .num { color: var(--success-color, #4caf50); }
+        .previous-cycle .pace-up .num { color: var(--error-color, #db4437); }
         .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
         .tab {
           flex: 1;
@@ -946,6 +1137,7 @@ class PeaElectricBillCard extends HTMLElement {
         ${savingsBlock}
         ${exportBlock}
         ${netCostRow}
+        ${previousCycleBlock}
       </ha-card>
     `;
 
@@ -1216,6 +1408,10 @@ class PeaElectricBillCardEditor extends HTMLElement {
             <div class="row hint">Only enable this if you are registered in PEA's solar buy-back programme with an approved export meter - otherwise this shows income you don't actually receive.</div>`
           : ""
       }
+      <div class="row checkbox-row">
+        <input id="show_previous_cycle" type="checkbox" ${cfg.show_previous_cycle ? "checked" : ""} />
+        <label for="show_previous_cycle">Show previous billing cycle comparison (Bill cycle tab only)</label>
+      </div>
       <div class="two-col">
         <div class="row">
           <label>Ft adjustment (฿/unit)</label>
@@ -1242,6 +1438,9 @@ class PeaElectricBillCardEditor extends HTMLElement {
     );
     $("default_period").addEventListener("change", (e) =>
       this._valueChanged(["default_period"], e.target.value)
+    );
+    $("show_previous_cycle").addEventListener("change", (e) =>
+      this._valueChanged(["show_previous_cycle"], e.target.checked)
     );
     $("ft_baht").addEventListener("change", (e) =>
       this._valueChanged(["ft_baht"], Number(e.target.value))
