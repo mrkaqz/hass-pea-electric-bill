@@ -202,10 +202,11 @@ function dateKeyOf(date) {
 
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-// Fixed "22 Jun" style formatting for the previous-cycle date range, rather
-// than toLocaleDateString() (used for the "Since ..." label elsewhere) -
-// that label is a single localized date, but a "start - end" range reads
-// better with a consistent, compact, locale-independent format on both ends.
+// Fixed "22 Jun" style formatting, used for every date the card renders -
+// both the "Since ..." header and the previous-cycle range - so the two are
+// never shown in different styles side by side. Compact and locale-
+// independent; a "start - end" range in particular reads badly when its two
+// ends are formatted differently.
 function formatShortDate(date) {
   return `${date.getDate()} ${MONTH_ABBR[date.getMonth()]}`;
 }
@@ -958,7 +959,7 @@ class PeaElectricBillCard extends HTMLElement {
     const bill = this._calcBill(this._current);
     const period = this._period || "cycle";
     const cycleLabel = this._cycleStart
-      ? `Since ${this._cycleStart.toLocaleDateString()}`
+      ? `Since ${formatShortDate(this._cycleStart)}`
       : "Loading usage…";
 
     const tabs = Object.entries(PERIODS)
