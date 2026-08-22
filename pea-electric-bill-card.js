@@ -316,7 +316,14 @@ const STATS_SAFETY_MARGIN_MS = 3 * 60 * 60 * 1000; // 3 hours
 
 async function fetchUsageSegments(hass, entityId, start, end) {
   if (!entityId) return [];
-  const safeStatsEnd = new Date(Math.max(start.getTime(), end.getTime() - STATS_SAFETY_MARGIN_MS));
+  // The margin is relative to `now`, not to `end`: a period ending well in
+  // the past (e.g. last month's billing cycle) should get full statistics
+  // coverage right up to its own end, not have its final 3 hours carved out
+  // and handed to raw history, which is purged after ~10 days and would
+  // silently return nothing for them (see STATS_SAFETY_MARGIN_MS above).
+  const safeStatsEnd = new Date(
+    Math.max(start.getTime(), Math.min(end.getTime(), Date.now() - STATS_SAFETY_MARGIN_MS))
+  );
   const statPoints =
     safeStatsEnd.getTime() > start.getTime() ? await fetchStatPoints(hass, entityId, start, safeStatsEnd) : [];
   const tailStart = statPoints.length ? statPoints[statPoints.length - 1].time : start;
